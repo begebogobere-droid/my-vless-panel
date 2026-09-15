@@ -1,0 +1,14 @@
+{
+  "name": "myvpn-railway",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "better-sqlite3": "^11.1.2"
+  }
+}
