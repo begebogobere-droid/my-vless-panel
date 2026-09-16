@@ -29,15 +29,16 @@ const app = express();
 app.use(express.json());
 
 function checkAuth(req) {
-  const auth = req.headers["authorization"] || "";
-  return auth === `Bearer ${ADMIN_TOKEN}`;
+  const auth = (req.headers["authorization"] || "").trim();
+  return auth === `Bearer ${ADMIN_TOKEN.trim()}`;
 }
 
 // ---------------- Login ----------------
 
 app.post("/api/login", (req, res) => {
   const body = req.body || {};
-  if (body.token === ADMIN_TOKEN) {
+  const submitted = (body.token || "").toString().trim();
+  if (submitted === ADMIN_TOKEN.trim()) {
     return res.json({ ok: true });
   }
   return res.status(401).json({ ok: false, error: "پسورد اشتباه است" });
@@ -454,7 +455,7 @@ function setToken(t) { sessionStorage.setItem('admin_token', t); }
 function clearToken() { sessionStorage.removeItem('admin_token'); }
 
 async function doLogin() {
-  const val = document.getElementById('loginToken').value;
+  const val = document.getElementById('loginToken').value.trim();
   const errBox = document.getElementById('loginError');
   errBox.textContent = '';
   if (!val) return;
