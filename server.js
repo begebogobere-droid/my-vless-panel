@@ -33,6 +33,16 @@ function checkAuth(req) {
   return auth === `Bearer ${ADMIN_TOKEN}`;
 }
 
+// ---------------- Login ----------------
+
+app.post("/api/login", (req, res) => {
+  const body = req.body || {};
+  if (body.token === ADMIN_TOKEN) {
+    return res.json({ ok: true });
+  }
+  return res.status(401).json({ ok: false, error: "پسورد اشتباه است" });
+});
+
 // ---------------- Users API ----------------
 
 app.get("/api/users", (req, res) => {
@@ -46,14 +56,15 @@ app.post("/api/users", (req, res) => {
   const body = req.body || {};
   const uuid = crypto.randomUUID();
   const name = body.name || "";
-  const trafficLimit = Number(body.traffic_limit_gb || 0) * 1024 * 1024 * 1024;
+  // ورودی حالا بر اساس مگابایت (MB) هست تا بشه مقادیر کمتر از ۱ گیگ (مثل ۱۰۰ یا ۲۰۰ مگ) هم زد
+  const trafficLimit = Math.round(Number(body.traffic_limit_mb || 0) * 1024 * 1024);
   const expiresAt = body.expires_at ? Math.floor(new Date(body.expires_at).getTime() / 1000) : null;
 
   db.prepare(
     `INSERT INTO users (uuid, name, traffic_limit_bytes, expires_at, enabled) VALUES (?, ?, ?, ?, 1)`
   ).run(uuid, name, trafficLimit, expiresAt);
 
-  res.json({ uuid, name, traffic_limit_gb: body.traffic_limit_gb || 0, expires_at: body.expires_at || null });
+  res.json({ uuid, name, traffic_limit_mb: body.traffic_limit_mb || 0, expires_at: body.expires_at || null });
 });
 
 app.patch("/api/users/:id", (req, res) => {
@@ -64,9 +75,9 @@ app.patch("/api/users/:id", (req, res) => {
   const values = [];
 
   if (body.name !== undefined) { fields.push("name = ?"); values.push(body.name); }
-  if (body.traffic_limit_gb !== undefined) {
+  if (body.traffic_limit_mb !== undefined) {
     fields.push("traffic_limit_bytes = ?");
-    values.push(Number(body.traffic_limit_gb) * 1024 * 1024 * 1024);
+    values.push(Math.round(Number(body.traffic_limit_mb) * 1024 * 1024));
   }
   if (body.expires_at !== undefined) {
     fields.push("expires_at = ?");
@@ -127,6 +138,12 @@ app.delete("/api/ips/:id", (req, res) => {
 
 // ---------------- Subscription ----------------
 
+function fmtBytes(n) {
+  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + " GB";
+  if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(0) + " MB";
+  return n + " B";
+}
+
 app.get("/sub/:uuid", (req, res) => {
   const uuid = req.params.uuid;
   const user = db.prepare("SELECT * FROM users WHERE uuid = ?").get(uuid);
@@ -139,18 +156,50 @@ app.get("/sub/:uuid", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const name = encodeURIComponent(user.name || "user");
 
-  let links;
+  // --- کانفیگ‌های اصلی VLESS ---
+  let mainLinks;
   if (ips.length === 0) {
-    links = [`vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${name}`];
+    mainLinks = [`vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${name}`];
   } else {
-    links = ips.map((row) => {
+    mainLinks = ips.map((row) => {
       const label = encodeURIComponent(`${user.name || "user"}-${row.note || row.ip}`);
       return `vless://${uuid}@${row.ip}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${label}`;
     });
   }
 
-  const body = links.join("\n");
+  // --- دو کانفیگ اطلاعاتی (به‌عنوان entry غیرقابل اتصال، فقط برای نمایش وضعیت در اپ) ---
+  const nowSec = Math.floor(Date.now() / 1000);
+  let timeInfoLabel;
+  if (user.expires_at) {
+    const daysLeft = Math.ceil((user.expires_at - nowSec) / 86400);
+    timeInfoLabel = daysLeft >= 0 ? `⏳ زمان باقی‌مانده： ${daysLeft} روز` : `⏳ منقضی شده`;
+  } else {
+    timeInfoLabel = `⏳ زمان باقی‌مانده： بدون انقضا`;
+  }
+
+  const used = user.traffic_used_bytes || 0;
+  const limit = user.traffic_limit_bytes || 0;
+  const volInfoLabel = limit > 0
+    ? `📊 حجم： ${fmtBytes(used)} / ${fmtBytes(limit)}`
+    : `📊 حجم مصرفی： ${fmtBytes(used)} (نامحدود)`;
+
+  // این دو خط کانفیگ واقعی نیستن (به آدرس 127.0.0.1:1 با UUID تصادفی وصل می‌شن و کار نمی‌کنن)
+  // فقط برای نمایش عنوان در لیست کلاینت استفاده می‌شن
+  const infoLinks = [
+    `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(timeInfoLabel)}`,
+    `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(volInfoLabel)}`,
+  ];
+
+  const allLinks = [...infoLinks, ...mainLinks];
+  const body = allLinks.join("\n");
   const b64 = Buffer.from(body, "utf8").toString("base64");
+
+  // هدر استاندارد subscription-userinfo — اپ‌هایی مثل Happ/v2rayNG/NekoBox حجم و انقضا رو از این هدر می‌خونن
+  const userinfoParts = [`upload=0`, `download=${used}`, `total=${limit > 0 ? limit : 0}`];
+  if (user.expires_at) userinfoParts.push(`expire=${user.expires_at}`);
+  res.set("subscription-userinfo", userinfoParts.join("; "));
+  res.set("profile-update-interval", "12");
+  res.set("content-disposition", `attachment; filename="${name || "config"}"`);
   res.set("content-type", "text/plain; charset=utf-8").send(b64);
 });
 
@@ -279,7 +328,7 @@ const PANEL_HTML = `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>پنل مدیریت کانفیگ</title>
 <style>
 :root {
@@ -287,64 +336,97 @@ const PANEL_HTML = `<!DOCTYPE html>
   --blue:#3b82f6; --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
 }
 * { box-sizing:border-box; }
-body { font-family: Vazirmatn, Tahoma, sans-serif; background:var(--bg); color:var(--text); padding:20px; margin:0; }
-h1 { font-size:19px; margin:0 0 4px; }
-.sub { color:var(--muted); font-size:12px; margin-bottom:20px; }
-.card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:16px; }
+html, body { max-width:100%; overflow-x:hidden; }
+body { font-family: Vazirmatn, Tahoma, sans-serif; background:var(--bg); color:var(--text); padding:14px; margin:0; }
+h1 { font-size:17px; margin:0 0 4px; }
+.sub { color:var(--muted); font-size:12px; margin-bottom:16px; word-break:break-all; }
+.card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:14px; }
 .card h3 { margin:0 0 12px; font-size:13px; color:var(--muted); font-weight:normal; }
 .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-input, button, select { padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:#1a1e28; color:var(--text); font-size:13px; }
-input { min-width:140px; flex:1; }
+input, button, select { padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:#1a1e28; color:var(--text); font-size:13px; }
+input { min-width:0; width:100%; flex:1 1 140px; }
 button { cursor:pointer; background:var(--blue); border:none; font-weight:600; white-space:nowrap; transition:opacity .15s; }
 button:hover { opacity:.85; }
 button.secondary { background:#2a2f3a; }
 button.del { background:var(--red); }
-button.small { padding:5px 9px; font-size:12px; }
+button.small { padding:6px 10px; font-size:12px; }
+button.full { width:100%; }
+
+/* جدول روی موبایل به‌صورت کارت نمایش داده می‌شه */
 table { width:100%; border-collapse:collapse; margin-top:4px; font-size:13px; }
-th, td { padding:10px 8px; border-bottom:1px solid var(--border); text-align:right; }
-th { color:var(--muted); font-weight:normal; font-size:12px; }
-tr:hover td { background:#161a23; }
+th { display:none; }
+tr { display:block; border:1px solid var(--border); border-radius:10px; margin-bottom:10px; padding:10px; background:#0f1218; }
+td { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 2px; border:none; text-align:right; }
+td:before { content: attr(data-label); color:var(--muted); font-size:11px; flex-shrink:0; }
+td.actions { flex-wrap:wrap; justify-content:flex-start; }
+td.actions:before { display:none; }
+td.actions button { margin:2px; }
+
+@media (min-width: 720px) {
+  body { padding:20px; }
+  h1 { font-size:19px; }
+  input { min-width:140px; }
+  table { }
+  th { display:table-cell; color:var(--muted); font-weight:normal; font-size:12px; padding:10px 8px; border-bottom:1px solid var(--border); text-align:right; }
+  tr { display:table-row; border:none; margin:0; padding:0; background:transparent; }
+  tr:hover td { background:#161a23; }
+  td { display:table-cell; padding:10px 8px; border-bottom:1px solid var(--border); }
+  td:before { content:none; }
+}
+
 .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
 .badge.on { background:#14532d; color:var(--green); }
 .badge.off { background:#450a0a; color:var(--red); }
 .badge.warn { background:#451a03; color:var(--amber); }
-.bar { width:100px; height:6px; border-radius:99px; background:#242833; overflow:hidden; display:inline-block; vertical-align:middle; margin-inline-start:6px; }
+.bar { width:80px; height:6px; border-radius:99px; background:#242833; overflow:hidden; display:inline-block; vertical-align:middle; margin-inline-start:6px; }
 .bar-fill { height:100%; background:var(--blue); }
 .bar-fill.warn { background:var(--amber); }
 .bar-fill.danger { background:var(--red); }
-.actions button { margin-inline-start:4px; }
 .empty { text-align:center; color:var(--muted); padding:30px; }
-.toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--green); color:#0b0d12; padding:10px 18px; border-radius:8px; font-size:13px; font-weight:600; opacity:0; transition:opacity .2s; pointer-events:none; }
+.toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--green); color:#0b0d12; padding:10px 18px; border-radius:8px; font-size:13px; font-weight:600; opacity:0; transition:opacity .2s; pointer-events:none; max-width:90vw; text-align:center; z-index:50; }
 .toast.show { opacity:1; }
+
+/* صفحه لاگین */
+#loginScreen { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; padding:20px; z-index:100; }
+#loginScreen .box { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:24px; width:100%; max-width:340px; text-align:center; }
+#loginScreen h2 { margin:0 0 6px; font-size:16px; }
+#loginScreen p { color:var(--muted); font-size:12px; margin:0 0 16px; }
+#loginScreen input { margin-bottom:10px; text-align:center; }
+#loginError { color:var(--red); font-size:12px; min-height:16px; margin-top:8px; }
+#appRoot { display:none; }
 </style>
 </head>
 <body>
-<h1>پنل مدیریت کانفیگ VLESS</h1>
-<div class="sub" id="domainInfo"></div>
 
-<div class="card">
-  <h3>ورود</h3>
-  <div class="row">
-    <input id="token" type="password" placeholder="Admin Token" style="max-width:260px">
-    <button class="secondary" onclick="saveToken()">ذخیره و ورود</button>
+<div id="loginScreen">
+  <div class="box">
+    <h2>🔒 ورود به پنل</h2>
+    <p>برای دسترسی به پنل، رمز ادمین را وارد کنید</p>
+    <input id="loginToken" type="password" placeholder="Admin Token" onkeydown="if(event.key==='Enter') doLogin()">
+    <button class="full" onclick="doLogin()">ورود</button>
+    <div id="loginError"></div>
   </div>
 </div>
+
+<div id="appRoot">
+<h1>پنل مدیریت کانفیگ VLESS</h1>
+<div class="sub" id="domainInfo"></div>
 
 <div class="card">
   <h3>ساخت کانفیگ جدید</h3>
   <div class="row">
     <input id="name" placeholder="نام مشتری">
-    <input id="traffic" type="number" min="0" placeholder="حجم (GB) — 0 = نامحدود">
+    <input id="traffic" type="number" min="0" step="1" placeholder="حجم (مگابایت) — 0 = نامحدود">
     <input id="expires" type="date">
-    <button onclick="createUser()">➕ ساخت</button>
+    <button class="full" onclick="createUser()">➕ ساخت</button>
   </div>
 </div>
 
 <div class="card">
   <h3>مدیریت IP‌های تمیز (برای دور زدن بلاک)</h3>
   <div class="row">
-    <input id="ipInput" placeholder="IP یا چند IP (با اینتر/کاما/اسپیس جدا کن)" style="flex:2">
-    <button onclick="addIps()">➕ افزودن</button>
+    <input id="ipInput" placeholder="IP یا چند IP (با اینتر/کاما/اسپیس جدا کن)">
+    <button class="full" onclick="addIps()">➕ افزودن</button>
   </div>
   <div id="ipList" style="margin-top:10px; font-size:12px;"></div>
 </div>
@@ -352,7 +434,7 @@ tr:hover td { background:#161a23; }
 <div class="card">
   <div class="row" style="justify-content:space-between; margin-bottom:12px;">
     <h3 style="margin:0">لیست کاربران</h3>
-    <input id="search" placeholder="جستجو..." style="max-width:180px" oninput="renderTable()">
+    <input id="search" placeholder="جستجو..." oninput="renderTable()">
   </div>
   <table id="tbl">
     <thead><tr><th>نام</th><th>وضعیت</th><th>مصرف</th><th>انقضا</th><th>لینک</th><th></th></tr></thead>
@@ -360,15 +442,63 @@ tr:hover td { background:#161a23; }
   </table>
   <div id="emptyState" class="empty" style="display:none">هنوز کاربری ساخته نشده</div>
 </div>
+</div>
 
 <div class="toast" id="toast"></div>
 
 <script>
 let allUsers = [];
-function getToken() { return localStorage.getItem('admin_token') || ''; }
-function saveToken() { localStorage.setItem('admin_token', document.getElementById('token').value); load(); }
-document.getElementById('token').value = getToken();
-document.getElementById('domainInfo').textContent = 'دامنه سرور: ' + location.host;
+
+function getToken() { return sessionStorage.getItem('admin_token') || ''; }
+function setToken(t) { sessionStorage.setItem('admin_token', t); }
+function clearToken() { sessionStorage.removeItem('admin_token'); }
+
+async function doLogin() {
+  const val = document.getElementById('loginToken').value;
+  const errBox = document.getElementById('loginError');
+  errBox.textContent = '';
+  if (!val) return;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: val })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      setToken(val);
+      showApp();
+    } else {
+      errBox.textContent = 'رمز اشتباه است';
+    }
+  } catch (e) {
+    errBox.textContent = 'خطا در ارتباط با سرور';
+  }
+}
+
+function showApp() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appRoot').style.display = 'block';
+  document.getElementById('domainInfo').textContent = 'دامنه سرور: ' + location.host;
+  load();
+  loadIps();
+}
+
+// موقع بازکردن صفحه، اگه توکن ذخیره‌شده معتبره مستقیم برو تو، وگرنه فرم لاگین بمونه
+(async function initAuth() {
+  const t = getToken();
+  if (!t) return;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: t })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) showApp();
+    else clearToken();
+  } catch (e) {}
+})();
 
 function showToast(msg) {
   const t = document.getElementById('toast');
@@ -380,6 +510,13 @@ function showToast(msg) {
 async function api(path, opts={}) {
   opts.headers = Object.assign({ 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' }, opts.headers || {});
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    clearToken();
+    document.getElementById('loginScreen').style.display = 'flex';
+    document.getElementById('appRoot').style.display = 'none';
+    showToast('نشست منقضی شد، دوباره وارد شوید');
+    throw new Error('unauthorized');
+  }
   if (!res.ok) {
     const txt = await res.text();
     showToast('خطا: ' + res.status);
@@ -446,6 +583,12 @@ async function load() {
   renderTable();
 }
 
+function fmtMbGb(bytes) {
+  const mb = bytes / 1024**2;
+  if (mb >= 1024) return (mb/1024).toFixed(2) + ' GB';
+  return mb.toFixed(0) + ' MB';
+}
+
 function renderTable() {
   const q = (document.getElementById('search').value || '').toLowerCase();
   const tbody = document.querySelector('#tbl tbody');
@@ -455,11 +598,11 @@ function renderTable() {
   document.getElementById('emptyState').style.display = filtered.length ? 'none' : 'block';
 
   for (const u of filtered) {
-    const usedGb = u.traffic_used_bytes / 1024**3;
-    const limitGb = u.traffic_limit_bytes / 1024**3;
-    const pct = limitGb > 0 ? Math.min(100, (usedGb/limitGb)*100) : 0;
+    const usedBytes = u.traffic_used_bytes || 0;
+    const limitBytes = u.traffic_limit_bytes || 0;
+    const pct = limitBytes > 0 ? Math.min(100, (usedBytes/limitBytes)*100) : 0;
     const barClass = pct > 90 ? 'danger' : pct > 70 ? 'warn' : '';
-    const usedTxt = usedGb.toFixed(2) + (limitGb > 0 ? ' / ' + limitGb.toFixed(2) + ' GB' : ' GB (نامحدود)');
+    const usedTxt = fmtMbGb(usedBytes) + (limitBytes > 0 ? ' / ' + fmtMbGb(limitBytes) : ' (نامحدود)');
 
     const dl = daysLeft(u.expires_at);
     let expiresTxt = '—';
@@ -476,11 +619,11 @@ function renderTable() {
 
     const tr = document.createElement('tr');
     tr.innerHTML = \`
-      <td>\${u.name || '(بدون نام)'}</td>
-      <td>\${statusBadge}</td>
-      <td>\${usedTxt}\${limitGb>0 ? '<span class="bar"><span class="bar-fill '+barClass+'" style="width:'+pct+'%"></span></span>' : ''}</td>
-      <td>\${expiresTxt} \${expBadge}</td>
-      <td><button class="small secondary" onclick="copyLink('\${u.id}')">📋 کپی ساب‌اسکریپشن</button></td>
+      <td data-label="نام">\${u.name || '(بدون نام)'}</td>
+      <td data-label="وضعیت">\${statusBadge}</td>
+      <td data-label="مصرف">\${usedTxt}\${limitBytes>0 ? '<span class="bar"><span class="bar-fill '+barClass+'" style="width:'+pct+'%"></span></span>' : ''}</td>
+      <td data-label="انقضا">\${expiresTxt} \${expBadge}</td>
+      <td data-label="لینک"><button class="small secondary" onclick="copyLink('\${u.id}')">📋 کپی ساب‌اسکریپشن</button></td>
       <td class="actions">
         <button class="small secondary" onclick="toggleUser(\${u.id}, \${u.enabled ? 0 : 1})">\${u.enabled ? 'غیرفعال' : 'فعال'}</button>
         <button class="small secondary" onclick="resetTraffic(\${u.id})">ریست حجم</button>
@@ -499,10 +642,10 @@ function copyLink(id) {
 
 async function createUser() {
   const name = document.getElementById('name').value;
-  const traffic_limit_gb = document.getElementById('traffic').value || 0;
+  const traffic_limit_mb = document.getElementById('traffic').value || 0;
   const expires_at = document.getElementById('expires').value || null;
   try {
-    await api('/api/users', { method: 'POST', body: JSON.stringify({ name, traffic_limit_gb, expires_at }) });
+    await api('/api/users', { method: 'POST', body: JSON.stringify({ name, traffic_limit_mb, expires_at }) });
     document.getElementById('name').value = '';
     document.getElementById('traffic').value = '';
     document.getElementById('expires').value = '';
@@ -528,9 +671,6 @@ async function delUser(id) {
   showToast('حذف شد');
   load();
 }
-
-load();
-loadIps();
 </script>
 </body>
 </html>`;
