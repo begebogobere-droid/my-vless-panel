@@ -15,6 +15,54 @@ const PORT = process.env.PORT || 8080;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.ADMIN_PASSWORD || "changeme";
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "data", "app.db");
 
+// ---------------- تشخیص خودکار کشور سرور (برای پرچم و لیبل لوکیشن) ----------------
+
+let serverLocation = { countryCode: null, countryName: null, flag: "🌐" };
+
+function countryCodeToFlag(cc) {
+  if (!cc || cc.length !== 2) return "🌐";
+  const codePoints = cc.toUpperCase().split("").map((c) => 0x1f1e6 - 65 + c.charCodeAt(0));
+  return String.fromCodePoint(...codePoints);
+}
+
+async function detectServerLocation() {
+  try {
+    const res = await fetch("https://ipapi.co/json/", { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error("bad status " + res.status);
+    const data = await res.json();
+    if (data && data.country_code) {
+      serverLocation = {
+        countryCode: data.country_code,
+        countryName: data.country_name || data.country_code,
+        flag: countryCodeToFlag(data.country_code),
+      };
+      console.log("Server location detected:", serverLocation);
+      return;
+    }
+    throw new Error("no country_code in response");
+  } catch (err) {
+    console.error("Location detection failed, retrying with fallback API:", err.message);
+    try {
+      const res2 = await fetch("https://ipwho.is/", { signal: AbortSignal.timeout(5000) });
+      const data2 = await res2.json();
+      if (data2 && data2.country_code) {
+        serverLocation = {
+          countryCode: data2.country_code,
+          countryName: data2.country || data2.country_code,
+          flag: countryCodeToFlag(data2.country_code),
+        };
+        console.log("Server location detected (fallback):", serverLocation);
+      }
+    } catch (err2) {
+      console.error("Fallback location detection also failed:", err2.message);
+    }
+  }
+}
+
+detectServerLocation();
+// هر ۶ ساعت یه‌بار دوباره چک کن (چون IP سرور روی Railway ممکنه عوض بشه)
+setInterval(detectServerLocation, 6 * 60 * 60 * 1000);
+
 // ---------------- DB init ----------------
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -148,50 +196,67 @@ function fmtBytes(n) {
 app.get("/sub/:uuid", (req, res) => {
   const uuid = req.params.uuid;
   const user = db.prepare("SELECT * FROM users WHERE uuid = ?").get(uuid);
-  if (!user || !user.enabled) return res.status(404).send("not found");
-  if (user.expires_at && user.expires_at < Math.floor(Date.now() / 1000)) {
-    return res.status(403).send("expired");
-  }
+  if (!user) return res.status(404).send("not found");
 
-  const ips = db.prepare("SELECT ip, note FROM clean_ips WHERE active = 1 ORDER BY created_at DESC").all();
   const host = req.headers["x-forwarded-host"] || req.headers.host;
-  const name = encodeURIComponent(user.name || "user");
+  const flag = serverLocation.flag || "🌐";
+  const name = user.name || "user";
 
-  // --- کانفیگ‌های اصلی VLESS ---
-  let mainLinks;
-  if (ips.length === 0) {
-    mainLinks = [`vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${name}`];
-  } else {
-    mainLinks = ips.map((row) => {
-      const label = encodeURIComponent(`${user.name || "user"}-${row.note || row.ip}`);
-      return `vless://${uuid}@${row.ip}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${label}`;
-    });
-  }
-
-  // --- دو کانفیگ اطلاعاتی (به‌عنوان entry غیرقابل اتصال، فقط برای نمایش وضعیت در اپ) ---
   const nowSec = Math.floor(Date.now() / 1000);
-  let timeInfoLabel;
-  if (user.expires_at) {
-    const daysLeft = Math.ceil((user.expires_at - nowSec) / 86400);
-    timeInfoLabel = daysLeft >= 0 ? `⏳ زمان باقی‌مانده： ${daysLeft} روز` : `⏳ منقضی شده`;
-  } else {
-    timeInfoLabel = `⏳ زمان باقی‌مانده： بدون انقضا`;
-  }
-
   const used = user.traffic_used_bytes || 0;
   const limit = user.traffic_limit_bytes || 0;
-  const volInfoLabel = limit > 0
-    ? `📊 حجم： ${fmtBytes(used)} / ${fmtBytes(limit)}`
-    : `📊 حجم مصرفی： ${fmtBytes(used)} (نامحدود)`;
+  const isExpired = user.expires_at && user.expires_at < nowSec;
+  const isQuotaExceeded = limit > 0 && used >= limit;
+  const isBlocked = !user.enabled || isExpired || isQuotaExceeded;
 
-  // این دو خط کانفیگ واقعی نیستن (به آدرس 127.0.0.1:1 با UUID تصادفی وصل می‌شن و کار نمی‌کنن)
-  // فقط برای نمایش عنوان در لیست کلاینت استفاده می‌شن
-  const infoLinks = [
-    `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(timeInfoLabel)}`,
-    `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(volInfoLabel)}`,
-  ];
+  let allLinks;
 
-  const allLinks = [...infoLinks, ...mainLinks];
+  if (isBlocked) {
+    // به‌جای کانفیگ واقعی، فقط یه پیام وضعیت برمی‌گردونه که کل چیزهای قبلی رو جای خودش می‌گیره
+    let reason;
+    if (isQuotaExceeded) reason = "🚫 حجم کانفیگ شما به اتمام رسیده";
+    else if (isExpired) reason = "🚫 کانفیگ شما منقضی شده";
+    else reason = "🚫 کانفیگ شما غیرفعال شده";
+
+    allLinks = [
+      `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(reason)}`,
+    ];
+  } else {
+    const ips = db.prepare("SELECT ip, note FROM clean_ips WHERE active = 1 ORDER BY created_at DESC").all();
+    const encName = encodeURIComponent(`${flag} ${name}`);
+
+    // --- کانفیگ‌های اصلی VLESS ---
+    let mainLinks;
+    if (ips.length === 0) {
+      mainLinks = [`vless://${uuid}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${encName}`];
+    } else {
+      mainLinks = ips.map((row) => {
+        const label = encodeURIComponent(`${flag} ${name}-${row.note || row.ip}`);
+        return `vless://${uuid}@${row.ip}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=%2F#${label}`;
+      });
+    }
+
+    // --- دو کانفیگ اطلاعاتی (به‌عنوان entry غیرقابل اتصال، فقط برای نمایش وضعیت در اپ) ---
+    let timeInfoLabel;
+    if (user.expires_at) {
+      const daysLeft = Math.ceil((user.expires_at - nowSec) / 86400);
+      timeInfoLabel = `⏳ زمان باقی‌مانده： ${daysLeft} روز`;
+    } else {
+      timeInfoLabel = `⏳ زمان باقی‌مانده： بدون انقضا`;
+    }
+
+    const volInfoLabel = limit > 0
+      ? `📊 حجم： ${fmtBytes(used)} / ${fmtBytes(limit)}`
+      : `📊 حجم مصرفی： ${fmtBytes(used)} (نامحدود)`;
+
+    const infoLinks = [
+      `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(timeInfoLabel)}`,
+      `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?encryption=none&security=none&type=tcp#${encodeURIComponent(volInfoLabel)}`,
+    ];
+
+    allLinks = [...infoLinks, ...mainLinks];
+  }
+
   const body = allLinks.join("\n");
   const b64 = Buffer.from(body, "utf8").toString("base64");
 
@@ -200,7 +265,51 @@ app.get("/sub/:uuid", (req, res) => {
   if (user.expires_at) userinfoParts.push(`expire=${user.expires_at}`);
   res.set("subscription-userinfo", userinfoParts.join("; "));
   res.set("profile-update-interval", "12");
-  res.set("content-disposition", `attachment; filename="${name || "config"}"`);
+
+  // اگه درخواست مستقیم از مرورگر باشه (نه از اپ کلاینت) یه صفحه خوانا با دکمه کپی نشون بده
+  const accept = req.headers["accept"] || "";
+  const ua = req.headers["user-agent"] || "";
+  const looksLikeBrowser = accept.includes("text/html") && !/happ|v2ray|nekobox|clash|shadowrocket|streisand/i.test(ua);
+
+  if (looksLikeBrowser) {
+    const linksHtml = allLinks.map((l) => {
+      const label = decodeURIComponent(l.split("#")[1] || "");
+      return `<div class="linkrow"><div class="linklabel">${label}</div><textarea readonly onclick="this.select()">${l}</textarea><button onclick="copyLine(this)" data-link="${encodeURIComponent(l)}">📋 کپی</button></div>`;
+    }).join("");
+
+    const html = `<!DOCTYPE html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>کانفیگ شما</title>
+<style>
+body{font-family:Tahoma,sans-serif;background:#0b0d12;color:#e8eaed;padding:16px;margin:0}
+h2{font-size:16px;margin:0 0 14px}
+.linkrow{background:#12151c;border:1px solid #242833;border-radius:10px;padding:12px;margin-bottom:12px}
+.linklabel{font-size:13px;color:#8b91a0;margin-bottom:6px}
+textarea{width:100%;background:#1a1e28;color:#e8eaed;border:1px solid #242833;border-radius:6px;padding:8px;font-size:11px;font-family:monospace;resize:none;height:60px;box-sizing:border-box}
+button{margin-top:8px;padding:8px 14px;border-radius:8px;border:none;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#22c55e;color:#0b0d12;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;opacity:0;transition:opacity .2s}
+.toast.show{opacity:1}
+</style></head>
+<body>
+<h2>📄 کانفیگ‌های شما (${name})</h2>
+${linksHtml}
+<div class="toast" id="toast">کپی شد</div>
+<script>
+function copyLine(btn){
+  const link = decodeURIComponent(btn.getAttribute('data-link'));
+  navigator.clipboard.writeText(link).then(()=>{
+    const t = document.getElementById('toast');
+    t.classList.add('show');
+    setTimeout(()=>t.classList.remove('show'), 1500);
+  });
+}
+</script>
+</body></html>`;
+    return res.set("content-type", "text/html; charset=utf-8").send(html);
+  }
+
+  res.set("content-disposition", `attachment; filename="${encodeURIComponent(name) || "config"}"`);
   res.set("content-type", "text/plain; charset=utf-8").send(b64);
 });
 
